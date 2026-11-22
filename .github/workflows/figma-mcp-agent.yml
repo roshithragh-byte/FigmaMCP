@@ -1,0 +1,53 @@
+name: Figma MCP Agent Gateway CI
+
+on:
+  workflow_call:
+    inputs:
+      gateway_url:
+        required: true
+        type: string
+        description: "Cloud Run URL of the Governed Figma MCP Server"
+      workload_identity_provider:
+        required: true
+        type: string
+        description: "Google Cloud Workload Identity Provider resource name"
+      service_account:
+        required: true
+        type: string
+        description: "Google Cloud Service Account with roles/run.invoker permission"
+    secrets:
+      FIGMA_FILE_KEY:
+        required: false
+        description: "Target Figma design file key"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  figma-agent-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to Google Cloud via Workload Identity Federation
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: "id_token"
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.service_account }}
+          id_token_audience: ${{ inputs.gateway_url }}
+          id_token_include_email: true
+
+      - name: Probe Governed Figma MCP Gateway Health
+        run: |
+          ID_TOKEN="${{ steps.auth.outputs.id_token }}"
+          curl -sSf -H "Authorization: Bearer ${ID_TOKEN}" "${{ inputs.gateway_url }}/healthz" | grep -q '"status":"ok"'
+
+      - name: Call Governed Figma MCP Server over Streamable HTTP
+        run: |
+          ID_TOKEN="${{ steps.auth.outputs.id_token }}"
+          curl -sSf -X POST "${{ inputs.gateway_url }}/mcp" \
+            -H "Authorization: Bearer ${ID_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json, text/event-stream" \
+            -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}'

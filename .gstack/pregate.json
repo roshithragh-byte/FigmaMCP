@@ -1,0 +1,18 @@
+{
+  "$schema": "https://github.com/garrytan/gstack/docs/pregate.md#pregate-v1",
+  "runner": "uv run pytest {files}",
+  "strays": {
+    "allow": ["uv.lock"]
+  },
+  "dependencies": {
+    "src/figma_mcp/cache.py": ["tests/test_cache.py"],
+    "src/figma_mcp/client.py": ["tests/test_client.py"],
+    "src/figma_mcp/compactor.py": ["tests/test_compactor.py"],
+    "src/figma_mcp/config.py": ["tests/test_client.py", "tests/test_server.py"],
+    "src/figma_mcp/models.py": ["tests/test_client.py", "tests/test_server.py"],
+    "src/figma_mcp/server.py": ["tests/test_server.py"],
+    ".github/workflows/figma-mcp-agent.yml": [],
+    "deploy.sh": [],
+    "uv.lock": []
+  }
+}
