@@ -11,10 +11,7 @@ class ConfigurationError(RuntimeError):
 
 
 def _is_test_environment() -> bool:
-    return (
-        os.environ.get("APP_ENV", "").lower() == "test"
-        or "PYTEST_CURRENT_TEST" in os.environ
-    )
+    return os.environ.get("APP_ENV", "").lower() == "test" or "PYTEST_CURRENT_TEST" in os.environ
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,7 +19,7 @@ class Settings:
     """Runtime configuration loaded from environment variables."""
 
     figma_access_token: str = field(repr=False)
-    figma_api_base_url: str = "https://api.figma.com/v1"
+    figma_api_base_url: str = "https://api.figma.com"
     host: str = "0.0.0.0"
     port: int = 8080
     log_level: str = "INFO"
@@ -107,9 +104,9 @@ class Settings:
 
         return cls(
             figma_access_token=token,
-            figma_api_base_url=os.environ.get(
-                "FIGMA_API_BASE_URL", "https://api.figma.com/v1"
-            ).rstrip("/"),
+            figma_api_base_url=os.environ.get("FIGMA_API_BASE_URL", "https://api.figma.com").rstrip(
+                "/"
+            ),
             host=os.environ.get("HOST", "0.0.0.0").strip() or "0.0.0.0",
             port=port,
             log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),

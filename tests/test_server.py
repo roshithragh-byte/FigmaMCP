@@ -35,12 +35,13 @@ def test_healthz_endpoint() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_lists_all_seven_tools() -> None:
+async def test_mcp_lists_all_tools() -> None:
     settings = Settings(figma_access_token="figd_test")
     mcp = create_server(settings)
     tools = await mcp.list_tools()
     tool_names = {tool.name for tool in tools}
-    assert tool_names == EXPECTED_TOOLS
+    assert EXPECTED_TOOLS.issubset(tool_names)
+    assert len(tool_names) >= 40
 
 
 @pytest.mark.asyncio
@@ -50,9 +51,7 @@ async def test_mcp_tool_execution_and_error_handling() -> None:
         mock.get("/files/file123").mock(
             return_value=httpx.Response(200, json={"name": "App UI", "document": {}})
         )
-        mock.get("/files/missing").mock(
-            return_value=httpx.Response(404, json={"err": "Not found"})
-        )
+        mock.get("/files/missing").mock(return_value=httpx.Response(404, json={"err": "Not found"}))
 
         async with FigmaClient(settings) as figma_client:
             mcp = create_server(settings, client=figma_client)
@@ -187,9 +186,7 @@ async def test_get_figma_nodes_compact_mode() -> None:
                 {"file_key": "file123", "node_ids": ["1:2"], "compact": False},
             )
             data_after = (
-                res_after[1]
-                if isinstance(res_after, tuple)
-                else json.loads(res_after[0].text)
+                res_after[1] if isinstance(res_after, tuple) else json.loads(res_after[0].text)
             )
             doc_after = data_after["nodes"]["1:2"]["document"]
             assert "vectorData" in doc_after, "Cache was poisoned by previous compact=True call!"

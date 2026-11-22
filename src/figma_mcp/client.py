@@ -1,4 +1,4 @@
-"""Async HTTP client wrapping the Figma REST API."""
+"""Async HTTP client wrapping the Figma REST API (v1 and v2)."""
 
 from __future__ import annotations
 
@@ -79,7 +79,12 @@ class FigmaClient:
             )
             headers: dict[str, str] = {"Accept": "application/json"}
             if settings.figma_access_token:
-                headers["X-Figma-Token"] = settings.figma_access_token
+                # Support both personal access token and oauth bearer format if user provided Bearer
+                if settings.figma_access_token.startswith("Bearer "):
+                    headers["Authorization"] = settings.figma_access_token
+                else:
+                    headers["X-Figma-Token"] = settings.figma_access_token
+
             self._client = httpx.AsyncClient(
                 base_url=settings.figma_api_base_url,
                 headers=headers,
@@ -104,6 +109,20 @@ class FigmaClient:
             return text.replace(token, "[REDACTED]")
         return text
 
+    def _normalize_path(self, path: str) -> str:
+        """Ensure path begins with /v1 or /v2 or default to /v1."""
+        stripped = path.strip()
+        if not stripped.startswith("/"):
+            stripped = f"/{stripped}"
+        if not (
+            stripped.startswith("/v1/")
+            or stripped.startswith("/v2/")
+            or stripped == "/v1"
+            or stripped == "/v2"
+        ):
+            stripped = f"/v1{stripped}"
+        return stripped
+
     async def _request(
         self,
         method: str,
@@ -111,37 +130,46 @@ class FigmaClient:
         *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        auth_header: str | None = None,
     ) -> dict[str, Any]:
-        if not self._settings.figma_access_token:
+        if not self._settings.figma_access_token and not auth_header:
             raise FigmaAPIError(
                 "FIGMA_ACCESS_TOKEN is not configured.",
                 status_code=401,
                 action="Set the FIGMA_ACCESS_TOKEN environment variable and restart the server.",
             )
 
+        full_path = self._normalize_path(path)
+        req_headers: dict[str, str] = {}
+        if auth_header:
+            req_headers["Authorization"] = auth_header
+
         try:
             response = await self._client.request(
                 method,
-                path,
+                full_path,
                 params=params,
                 json=json_body,
+                headers=req_headers if req_headers else None,
             )
         except httpx.TimeoutException as exc:
-            logger.warning("Figma API request timed out: %s %s", method, path)
+            logger.warning("Figma API request timed out: %s %s", method, full_path)
             raise FigmaAPIError(
                 "Request to Figma API timed out.",
                 status_code=504,
                 action="Retry the request or narrow the query using depth or node_ids.",
             ) from exc
         except httpx.RequestError as exc:
-            logger.warning("Figma API network error on %s %s: %s", method, path, type(exc).__name__)
+            logger.warning(
+                "Figma API network error on %s %s: %s", method, full_path, type(exc).__name__
+            )
             raise FigmaAPIError(
                 "Unable to reach the Figma API due to a network error.",
                 status_code=502,
                 action="Check network connectivity and retry.",
             ) from exc
 
-        if response.status_code == 200 or response.status_code == 201:
+        if response.status_code in (200, 201):
             try:
                 data: dict[str, Any] = response.json()
                 return data
@@ -151,6 +179,8 @@ class FigmaClient:
                     status_code=502,
                     action="Retry the request; if the issue persists, check Figma API status.",
                 ) from exc
+        elif response.status_code == 204:
+            return {"success": True}
 
         self._raise_for_status(response)
         raise AssertionError("Unreachable")  # pragma: no cover
@@ -219,6 +249,7 @@ class FigmaClient:
             action="Review the request parameters and try again.",
         )
 
+    # --- Core Files & Nodes ---
     async def get_file(
         self,
         file_key: str,
@@ -281,12 +312,58 @@ class FigmaClient:
         )
         return res  # type: ignore[no-any-return]
 
+    async def get_file_versions(
+        self,
+        file_key: str,
+        *,
+        page_size: int | None = 30,
+        before: str | None = None,
+        after: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if page_size is not None:
+            params["page_size"] = page_size
+        if before:
+            params["before"] = before
+        if after:
+            params["after"] = after
+        return await self._request("GET", f"/files/{file_key}/versions", params=params)
+
+    # --- Components & Styles ---
     async def get_file_components(self, file_key: str) -> dict[str, Any]:
         return await self._request("GET", f"/files/{file_key}/components")
 
     async def get_file_styles(self, file_key: str) -> dict[str, Any]:
         return await self._request("GET", f"/files/{file_key}/styles")
 
+    async def get_file_component_sets(self, file_key: str) -> dict[str, Any]:
+        return await self._request("GET", f"/files/{file_key}/component_sets")
+
+    async def get_team_components(
+        self, team_id: str, *, page_size: int = 30, cursor: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"page_size": page_size}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request("GET", f"/teams/{team_id}/components", params=params)
+
+    async def get_team_styles(
+        self, team_id: str, *, page_size: int = 30, cursor: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"page_size": page_size}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request("GET", f"/teams/{team_id}/styles", params=params)
+
+    async def get_team_component_sets(
+        self, team_id: str, *, page_size: int = 30, cursor: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"page_size": page_size}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request("GET", f"/teams/{team_id}/component_sets", params=params)
+
+    # --- Comments & Reactions ---
     async def get_file_comments(
         self,
         file_key: str,
@@ -313,3 +390,167 @@ class FigmaClient:
                 "node_offset": {"x": 0, "y": 0},
             }
         return await self._request("POST", f"/files/{file_key}/comments", json_body=body)
+
+    async def delete_file_comment(self, file_key: str, comment_id: str) -> dict[str, Any]:
+        return await self._request("DELETE", f"/files/{file_key}/comments/{comment_id}")
+
+    async def get_comment_reactions(
+        self, file_key: str, comment_id: str, *, cursor: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request(
+            "GET", f"/files/{file_key}/comments/{comment_id}/reactions", params=params
+        )
+
+    async def post_comment_reaction(
+        self, file_key: str, comment_id: str, emoji: str
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST", f"/files/{file_key}/comments/{comment_id}/reactions", json_body={"emoji": emoji}
+        )
+
+    async def delete_comment_reaction(
+        self, file_key: str, comment_id: str, emoji: str
+    ) -> dict[str, Any]:
+        params = {"emoji": emoji}
+        return await self._request(
+            "DELETE", f"/files/{file_key}/comments/{comment_id}/reactions", params=params
+        )
+
+    # --- Variables ---
+    async def get_local_variables(self, file_key: str) -> dict[str, Any]:
+        return await self._request("GET", f"/files/{file_key}/variables/local")
+
+    async def get_published_variables(self, file_key: str) -> dict[str, Any]:
+        return await self._request("GET", f"/files/{file_key}/variables/published")
+
+    async def post_variables_bulk_update(
+        self,
+        file_key: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await self._request("POST", f"/files/{file_key}/variables", json_body=body)
+
+    # --- Dev Resources ---
+    async def get_dev_resources(
+        self, file_key: str, *, node_ids: list[str] | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if node_ids:
+            params["node_ids"] = ",".join(sorted(set(node_ids)))
+        return await self._request("GET", f"/files/{file_key}/dev_resources", params=params)
+
+    async def post_dev_resources(self, dev_resources: list[dict[str, Any]]) -> dict[str, Any]:
+        return await self._request(
+            "POST", "/dev_resources", json_body={"dev_resources": dev_resources}
+        )
+
+    async def put_dev_resources(self, dev_resources: list[dict[str, Any]]) -> dict[str, Any]:
+        return await self._request(
+            "PUT", "/dev_resources", json_body={"dev_resources": dev_resources}
+        )
+
+    async def delete_dev_resource(self, file_key: str, dev_resource_id: str) -> dict[str, Any]:
+        return await self._request("DELETE", f"/files/{file_key}/dev_resources/{dev_resource_id}")
+
+    # --- Teams & Folders (v2 Projects) ---
+    async def get_team(self, team_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/teams/{team_id}")
+
+    async def get_team_folders(self, team_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v2/teams/{team_id}/folders")
+
+    async def get_folder_files(self, folder_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v2/folders/{folder_id}/files")
+
+    async def get_folder_subfolders(self, folder_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v2/folders/{folder_id}/folders")
+
+    async def create_folder(self, team_id: str, name: str) -> dict[str, Any]:
+        return await self._request("POST", f"/teams/{team_id}/folders", json_body={"name": name})
+
+    # --- Webhooks (v2) ---
+    async def list_webhooks(
+        self, *, context: str | None = None, context_id: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if context:
+            params["context"] = context
+        if context_id:
+            params["context_id"] = context_id
+        return await self._request("GET", "/v2/webhooks", params=params)
+
+    async def get_webhook(self, webhook_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v2/webhooks/{webhook_id}")
+
+    async def create_webhook(self, body: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("POST", "/v2/webhooks", json_body=body)
+
+    async def update_webhook(self, webhook_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("PUT", f"/v2/webhooks/{webhook_id}", json_body=body)
+
+    async def delete_webhook(self, webhook_id: str) -> dict[str, Any]:
+        return await self._request("DELETE", f"/v2/webhooks/{webhook_id}")
+
+    async def get_webhook_requests(self, webhook_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v2/webhooks/{webhook_id}/requests")
+
+    # --- Enterprise & Analytics ---
+    async def get_activity_logs(
+        self,
+        *,
+        events: str | None = None,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        limit: int | None = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if events:
+            params["events"] = events
+        if start_time:
+            params["start_time"] = start_time
+        if end_time:
+            params["end_time"] = end_time
+        if limit is not None:
+            params["limit"] = limit
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request("GET", "/activity_logs", params=params)
+
+    async def get_ai_usage(
+        self,
+        start_date: str,
+        end_date: str,
+        *,
+        user_email: str | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"start_date": start_date, "end_date": end_date}
+        if user_email:
+            params["user_email"] = user_email
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request("GET", "/ai_usage/daily", params=params)
+
+    async def get_library_analytics(
+        self,
+        library_file_key: str,
+        asset_type: str,
+        metric_type: str,
+        *,
+        group_by: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if group_by:
+            params["group_by"] = group_by
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
+        path = f"/analytics/libraries/{library_file_key}/{asset_type}/{metric_type}"
+        return await self._request("GET", path, params=params)
