@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from figma_mcp.cache import TTLCache
 from figma_mcp.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -60,9 +61,14 @@ class FigmaClient:
         settings: Settings,
         *,
         http_client: httpx.AsyncClient | None = None,
+        cache: TTLCache | None = None,
     ) -> None:
         self._settings = settings
         self._owns_client = http_client is None
+        self._cache = cache or TTLCache(
+            default_ttl=settings.cache_ttl_seconds,
+            maxsize=settings.cache_max_size,
+        )
         if http_client is not None:
             self._client = http_client
         else:
@@ -179,7 +185,9 @@ class FigmaClient:
             raise FigmaAPIError(
                 "Figma resource not found.",
                 status_code=404,
-                action="Check that the file_key (and any node_ids) exist and are spelled correctly.",
+                action=(
+                    "Check that the file_key (and any node_ids) exist and are spelled correctly."
+                ),
             )
         if status == 429:
             wait_hint = (
@@ -217,13 +225,20 @@ class FigmaClient:
         *,
         depth: int | None = 2,
         node_ids: list[str] | None = None,
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {}
         if depth is not None:
             params["depth"] = depth
         if node_ids:
-            params["ids"] = ",".join(node_ids)
-        return await self._request("GET", f"/files/{file_key}", params=params)
+            params["ids"] = ",".join(sorted(set(node_ids)))
+        cache_key = f"file:{file_key}:depth={depth}:ids={params.get('ids', '')}"
+        res = await self._cache.get_or_set(
+            cache_key,
+            lambda: self._request("GET", f"/files/{file_key}", params=params),
+            force_refresh=force_refresh,
+        )
+        return res  # type: ignore[no-any-return]
 
     async def get_nodes(
         self,
@@ -231,11 +246,18 @@ class FigmaClient:
         node_ids: list[str],
         *,
         depth: int | None = None,
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
-        params: dict[str, Any] = {"ids": ",".join(node_ids)}
+        params: dict[str, Any] = {"ids": ",".join(sorted(set(node_ids)))}
         if depth is not None:
             params["depth"] = depth
-        return await self._request("GET", f"/files/{file_key}/nodes", params=params)
+        cache_key = f"nodes:{file_key}:ids={params['ids']}:depth={depth}"
+        res = await self._cache.get_or_set(
+            cache_key,
+            lambda: self._request("GET", f"/files/{file_key}/nodes", params=params),
+            force_refresh=force_refresh,
+        )
+        return res  # type: ignore[no-any-return]
 
     async def export_images(
         self,
@@ -244,13 +266,20 @@ class FigmaClient:
         *,
         image_format: str = "png",
         scale: float = 1.0,
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
-            "ids": ",".join(node_ids),
+            "ids": ",".join(sorted(set(node_ids))),
             "format": image_format,
             "scale": scale,
         }
-        return await self._request("GET", f"/images/{file_key}", params=params)
+        cache_key = f"images:{file_key}:ids={params['ids']}:fmt={image_format}:scale={scale}"
+        res = await self._cache.get_or_set(
+            cache_key,
+            lambda: self._request("GET", f"/images/{file_key}", params=params),
+            force_refresh=force_refresh,
+        )
+        return res  # type: ignore[no-any-return]
 
     async def get_file_components(self, file_key: str) -> dict[str, Any]:
         return await self._request("GET", f"/files/{file_key}/components")

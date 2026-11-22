@@ -50,6 +50,14 @@ class GetFigmaFileInput(FileKeyInput):
         default=None,
         description="Optional list of node IDs to restrict the returned document subtree.",
     )
+    compact: bool = Field(
+        default=False,
+        description="When True, compacts AST by pruning heavy vector curves and transforms.",
+    )
+    force_refresh: bool = Field(
+        default=False,
+        description="When True, bypasses the in-memory cache and fetches fresh data from Figma.",
+    )
 
     @field_validator("node_ids")
     @classmethod
@@ -72,6 +80,14 @@ class GetFigmaNodesInput(FileKeyInput):
         ge=1,
         le=20,
         description="Optional traversal depth within each requested node.",
+    )
+    compact: bool = Field(
+        default=False,
+        description="When True, compacts AST by pruning heavy vector curves and transforms.",
+    )
+    force_refresh: bool = Field(
+        default=False,
+        description="When True, bypasses the in-memory cache and fetches fresh data from Figma.",
     )
 
     @field_validator("node_ids")
@@ -97,6 +113,10 @@ class ExportFigmaImagesInput(FileKeyInput):
         ge=0.01,
         le=4.0,
         description="Image scaling factor between 0.01 and 4.0.",
+    )
+    force_refresh: bool = Field(
+        default=False,
+        description="When True, bypasses the in-memory cache and fetches fresh image URLs.",
     )
 
     @field_validator("node_ids")

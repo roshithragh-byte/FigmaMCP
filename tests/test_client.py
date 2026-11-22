@@ -80,9 +80,11 @@ async def test_client_sends_token_header_and_calls_all_endpoints() -> None:
         )
 
         async with FigmaClient(_test_settings("figd_secret_123")) as client:
-            assert (await client.get_file("abc123", depth=2, node_ids=["1:2"]))["name"] == "Design System"
+            file_res = await client.get_file("abc123", depth=2, node_ids=["1:2"])
+            assert file_res["name"] == "Design System"
             assert "1:2" in (await client.get_nodes("abc123", ["1:2"], depth=1))["nodes"]
-            assert "1:2" in (await client.export_images("abc123", ["1:2"], image_format="png", scale=2.0))["images"]
+            img_res = await client.export_images("abc123", ["1:2"], image_format="png", scale=2.0)
+            assert "1:2" in img_res["images"]
             assert "meta" in await client.get_file_components("abc123")
             assert "meta" in await client.get_file_styles("abc123")
             assert "comments" in await client.get_file_comments("abc123", as_md=True)

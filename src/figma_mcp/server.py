@@ -16,6 +16,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from figma_mcp.client import FigmaAPIError, FigmaClient
+from figma_mcp.compactor import compact_figma_node
 from figma_mcp.config import Settings
 from figma_mcp.models import (
     ErrorResponse,
@@ -74,7 +75,7 @@ def create_server(
         lifespan=lifespan,
     )
 
-    @mcp.custom_route("/healthz", methods=["GET"])
+    @mcp.custom_route("/healthz", methods=["GET"])  # type: ignore[untyped-decorator]
     async def healthz(_: Request) -> JSONResponse:
         """Cloud Run liveness and readiness probe endpoint."""
         return JSONResponse({"status": "ok"}, status_code=200)
@@ -85,30 +86,57 @@ def create_server(
         lifespan_ctx = ctx.request_context.lifespan_context
         return lifespan_ctx["figma_client"]  # type: ignore[no-any-return]
 
+    def _check_file_authorization(file_key: str) -> dict[str, Any] | None:
+        if (
+            resolved_settings.allowed_file_keys is not None
+            and file_key not in resolved_settings.allowed_file_keys
+        ):
+            return ErrorResponse(
+                error=f"Access to file '{file_key}' is not allowed by this gateway.",
+                status_code=403,
+                action="Verify the file_key or configure FIGMA_ALLOWED_FILE_KEYS.",
+            ).model_dump(exclude_none=True)
+        return None
+
     @mcp.tool()
     async def get_figma_file(
         file_key: str,
         depth: int | None = 2,
         node_ids: list[str] | None = None,
+        compact: bool = False,
+        force_refresh: bool = False,
         ctx: Context[Any, Any, Any] | None = None,
     ) -> dict[str, Any]:
         """Retrieve a Figma file's document tree and metadata.
 
         Defaults to depth=2 to prevent oversized payloads on large design files.
-        Optionally filter to specific node_ids.
+        Optionally filter to specific node_ids, set compact=True for token-saving AST pruning,
+        or set force_refresh=True to bypass the cache.
         """
         try:
             validated = GetFigmaFileInput(
                 file_key=file_key,
                 depth=depth,
                 node_ids=node_ids,
+                compact=compact,
+                force_refresh=force_refresh,
             )
+            auth_err = _check_file_authorization(validated.file_key)
+            if auth_err is not None:
+                return auth_err
             assert ctx is not None
-            return await _get_client(ctx).get_file(
+            raw_file = await _get_client(ctx).get_file(
                 validated.file_key,
                 depth=validated.depth,
                 node_ids=validated.node_ids,
+                force_refresh=validated.force_refresh,
             )
+            if validated.compact and "document" in raw_file:
+                return {
+                    **raw_file,
+                    "document": compact_figma_node(raw_file["document"]),
+                }
+            return raw_file
         except ValidationError as exc:
             return _validation_error_dict(exc)
         except FigmaAPIError as exc:
@@ -119,21 +147,45 @@ def create_server(
         file_key: str,
         node_ids: list[str],
         depth: int | None = None,
+        compact: bool = False,
+        force_refresh: bool = False,
         ctx: Context[Any, Any, Any] | None = None,
     ) -> dict[str, Any]:
-        """Retrieve specific nodes and their subtrees from a Figma file."""
+        """Retrieve specific nodes and their subtrees from a Figma file.
+
+        Set compact=True to prune heavy vector geometry and transforms,
+        or set force_refresh=True to bypass the cache.
+        """
         try:
             validated = GetFigmaNodesInput(
                 file_key=file_key,
                 node_ids=node_ids,
                 depth=depth,
+                compact=compact,
+                force_refresh=force_refresh,
             )
+            auth_err = _check_file_authorization(validated.file_key)
+            if auth_err is not None:
+                return auth_err
             assert ctx is not None
-            return await _get_client(ctx).get_nodes(
+            raw_nodes = await _get_client(ctx).get_nodes(
                 validated.file_key,
                 validated.node_ids,
                 depth=validated.depth,
+                force_refresh=validated.force_refresh,
             )
+            if validated.compact and "nodes" in raw_nodes and isinstance(raw_nodes["nodes"], dict):
+                compacted_nodes: dict[str, Any] = {}
+                for nid, nentry in raw_nodes["nodes"].items():
+                    if isinstance(nentry, dict) and "document" in nentry:
+                        compacted_nodes[nid] = {
+                            **nentry,
+                            "document": compact_figma_node(nentry["document"]),
+                        }
+                    else:
+                        compacted_nodes[nid] = nentry
+                return {**raw_nodes, "nodes": compacted_nodes}
+            return raw_nodes
         except ValidationError as exc:
             return _validation_error_dict(exc)
         except FigmaAPIError as exc:
@@ -145,22 +197,31 @@ def create_server(
         node_ids: list[str],
         format: Literal["png", "svg", "jpg", "pdf"] = "png",
         scale: float = 1.0,
+        force_refresh: bool = False,
         ctx: Context[Any, Any, Any] | None = None,
     ) -> dict[str, Any]:
-        """Render and return download URLs for specific Figma nodes in png, svg, jpg, or pdf."""
+        """Render and return download URLs for specific Figma nodes in png, svg, jpg, or pdf.
+
+        Set force_refresh=True to bypass cached image URLs.
+        """
         try:
             validated = ExportFigmaImagesInput(
                 file_key=file_key,
                 node_ids=node_ids,
                 format=format,
                 scale=scale,
+                force_refresh=force_refresh,
             )
+            auth_err = _check_file_authorization(validated.file_key)
+            if auth_err is not None:
+                return auth_err
             assert ctx is not None
             return await _get_client(ctx).export_images(
                 validated.file_key,
                 validated.node_ids,
                 image_format=validated.format,
                 scale=validated.scale,
+                force_refresh=validated.force_refresh,
             )
         except ValidationError as exc:
             return _validation_error_dict(exc)
@@ -175,6 +236,9 @@ def create_server(
         """List published components defined in a Figma file."""
         try:
             validated = FileKeyInput(file_key=file_key)
+            auth_err = _check_file_authorization(validated.file_key)
+            if auth_err is not None:
+                return auth_err
             assert ctx is not None
             return await _get_client(ctx).get_file_components(validated.file_key)
         except ValidationError as exc:
@@ -190,6 +254,9 @@ def create_server(
         """List published styles (color, text, effect, grid) in a Figma file."""
         try:
             validated = FileKeyInput(file_key=file_key)
+            auth_err = _check_file_authorization(validated.file_key)
+            if auth_err is not None:
+                return auth_err
             assert ctx is not None
             return await _get_client(ctx).get_file_styles(validated.file_key)
         except ValidationError as exc:
@@ -206,6 +273,9 @@ def create_server(
         """Retrieve comments on a Figma file, optionally formatted as Markdown."""
         try:
             validated = GetFileCommentsInput(file_key=file_key, as_md=as_md)
+            auth_err = _check_file_authorization(validated.file_key)
+            if auth_err is not None:
+                return auth_err
             assert ctx is not None
             return await _get_client(ctx).get_file_comments(
                 validated.file_key,
@@ -226,12 +296,22 @@ def create_server(
     ) -> dict[str, Any]:
         """Post a new comment on a Figma file or reply to an existing comment."""
         try:
+            if resolved_settings.read_only:
+                return ErrorResponse(
+                    error="Figma MCP server is running in read-only mode.",
+                    status_code=403,
+                    action="Disable FIGMA_READ_ONLY in server configuration to allow commenting.",
+                ).model_dump(exclude_none=True)
+
             validated = PostFileCommentInput(
                 file_key=file_key,
                 message=message,
                 node_id=node_id,
                 comment_id=comment_id,
             )
+            auth_err = _check_file_authorization(validated.file_key)
+            if auth_err is not None:
+                return auth_err
             assert ctx is not None
             return await _get_client(ctx).post_file_comment(
                 validated.file_key,

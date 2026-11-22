@@ -81,15 +81,24 @@ gcloud builds submit \
   --project="${PROJECT_ID}" \
   .
 
-# 5. Deploy to Cloud Run with IAM auth enforced and secret mounted
+# 5. Deploy to Cloud Run with IAM auth enforced, max-instances=1 for cache coherence, and secret mounted
 echo "==> Deploying '${SERVICE_NAME}' to Cloud Run..."
+READ_ONLY_FLAG="${FIGMA_READ_ONLY:-true}"
+ALLOWED_KEYS="${FIGMA_ALLOWED_FILE_KEYS:-}"
+
+ENV_VARS="^@^FIGMA_READ_ONLY=${READ_ONLY_FLAG}"
+if [[ -n "${ALLOWED_KEYS}" ]]; then
+  ENV_VARS="${ENV_VARS}@FIGMA_ALLOWED_FILE_KEYS=${ALLOWED_KEYS}"
+fi
+
 gcloud run deploy "${SERVICE_NAME}" \
   --image="${IMAGE_URI}" \
   --region="${REGION}" \
   --project="${PROJECT_ID}" \
   --service-account="${RUNTIME_SA}" \
-  --functional-type=mcp-server \
+  --max-instances=1 \
   --no-allow-unauthenticated \
+  --set-env-vars="${ENV_VARS}" \
   --set-secrets="FIGMA_ACCESS_TOKEN=${SECRET_NAME}:latest"
 
 SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
