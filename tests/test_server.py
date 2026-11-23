@@ -176,8 +176,13 @@ async def test_get_figma_nodes_compact_mode() -> None:
             )
             doc_compact = data_compact["nodes"]["1:2"]["document"]
             assert "vectorData" not in doc_compact
-            assert doc_compact["width"] == 100.0
-            assert doc_compact["height"] == 50.0
+            # Pruner outputs compact box dictionary {x, y, width, height}
+            if "box" in doc_compact:
+                assert doc_compact["box"]["width"] == 100.0
+                assert doc_compact["box"]["height"] == 50.0
+            else:
+                assert doc_compact["width"] == 100.0
+                assert doc_compact["height"] == 50.0
 
             # 3. Cache isolation: Request with compact=False immediately after compact=True
             # must still return full uncompacted vector data from cache!

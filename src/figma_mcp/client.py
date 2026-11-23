@@ -1,4 +1,4 @@
-"""Async HTTP client wrapping the Figma REST API (v1 and v2)."""
+"""Async HTTP client wrapping Figma REST API (v1 and v2) with two-tier caching & pruning."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-from figma_mcp.cache import TTLCache
+from figma_mcp.cache import TwoTierFigmaCache
 from figma_mcp.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -54,20 +54,21 @@ def _parse_retry_after(headers: httpx.Headers) -> int | None:
 
 
 class FigmaClient:
-    """Async Figma REST API client backed by a pooled httpx.AsyncClient."""
+    """Async Figma REST API client backed by a pooled httpx.AsyncClient and TwoTierFigmaCache."""
 
     def __init__(
         self,
         settings: Settings,
         *,
         http_client: httpx.AsyncClient | None = None,
-        cache: TTLCache | None = None,
+        cache: TwoTierFigmaCache | None = None,
     ) -> None:
         self._settings = settings
         self._owns_client = http_client is None
-        self._cache = cache or TTLCache(
-            default_ttl=settings.cache_ttl_seconds,
-            maxsize=settings.cache_max_size,
+        self._cache = cache or TwoTierFigmaCache(
+            redis_url=settings.redis_url,
+            l1_ttl_seconds=settings.cache_ttl_seconds,
+            l1_max_size=settings.cache_max_size,
         )
         if http_client is not None:
             self._client = http_client
@@ -79,7 +80,6 @@ class FigmaClient:
             )
             headers: dict[str, str] = {"Accept": "application/json"}
             if settings.figma_access_token:
-                # Support both personal access token and oauth bearer format if user provided Bearer
                 if settings.figma_access_token.startswith("Bearer "):
                     headers["Authorization"] = settings.figma_access_token
                 else:
@@ -99,9 +99,10 @@ class FigmaClient:
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Close the underlying HTTP client if owned by this instance."""
+        """Close the underlying HTTP client and L2 cache connection pool."""
         if self._owns_client:
             await self._client.aclose()
+        await self._cache.aclose()
 
     def _sanitize_text(self, text: str) -> str:
         token = self._settings.figma_access_token
@@ -215,9 +216,7 @@ class FigmaClient:
             raise FigmaAPIError(
                 "Figma resource not found.",
                 status_code=404,
-                action=(
-                    "Check that the file_key (and any node_ids) exist and are spelled correctly."
-                ),
+                action="Check that the file_key and node_ids exist and are spelled correctly.",
             )
         if status == 429:
             wait_hint = (
@@ -249,6 +248,25 @@ class FigmaClient:
             action="Review the request parameters and try again.",
         )
 
+    # --- Version Resolution ---
+    async def get_file_version_id(self, file_key: str, *, force_refresh: bool = False) -> str:
+        """Resolve a lightweight version ID for a file (cached for 60 seconds)."""
+        cache_key = f"figma:version:{file_key}"
+        if not force_refresh:
+            cached_version = await self._cache.get(cache_key)
+            if cached_version:
+                return str(cached_version)
+
+        try:
+            # Query lightweight depth=1 or versions endpoint
+            file_meta = await self._request("GET", f"/files/{file_key}", params={"depth": 1})
+            version_id = str(file_meta.get("version") or file_meta.get("lastModified") or "live")
+        except Exception:
+            version_id = "live"
+
+        await self._cache.set(cache_key, version_id, ttl_seconds=60)
+        return version_id
+
     # --- Core Files & Nodes ---
     async def get_file(
         self,
@@ -263,10 +281,14 @@ class FigmaClient:
             params["depth"] = depth
         if node_ids:
             params["ids"] = ",".join(sorted(set(node_ids)))
-        cache_key = f"file:{file_key}:depth={depth}:ids={params.get('ids', '')}"
+
+        version_id = await self.get_file_version_id(file_key, force_refresh=force_refresh)
+        cache_key = TwoTierFigmaCache.make_key("get_file", file_key, version_id, **params)
+
         res = await self._cache.get_or_set(
             cache_key,
             lambda: self._request("GET", f"/files/{file_key}", params=params),
+            ttl_seconds=86400,
             force_refresh=force_refresh,
         )
         return res  # type: ignore[no-any-return]
@@ -282,10 +304,14 @@ class FigmaClient:
         params: dict[str, Any] = {"ids": ",".join(sorted(set(node_ids)))}
         if depth is not None:
             params["depth"] = depth
-        cache_key = f"nodes:{file_key}:ids={params['ids']}:depth={depth}"
+
+        version_id = await self.get_file_version_id(file_key, force_refresh=force_refresh)
+        cache_key = TwoTierFigmaCache.make_key("get_nodes", file_key, version_id, **params)
+
         res = await self._cache.get_or_set(
             cache_key,
             lambda: self._request("GET", f"/files/{file_key}/nodes", params=params),
+            ttl_seconds=86400,
             force_refresh=force_refresh,
         )
         return res  # type: ignore[no-any-return]
@@ -304,10 +330,14 @@ class FigmaClient:
             "format": image_format,
             "scale": scale,
         }
-        cache_key = f"images:{file_key}:ids={params['ids']}:fmt={image_format}:scale={scale}"
+        # Image CDN links expire after ~14-30 days; cache with 15-minute TTL
+        version_id = await self.get_file_version_id(file_key, force_refresh=force_refresh)
+        cache_key = TwoTierFigmaCache.make_key("export_images", file_key, version_id, **params)
+
         res = await self._cache.get_or_set(
             cache_key,
             lambda: self._request("GET", f"/images/{file_key}", params=params),
+            ttl_seconds=900,
             force_refresh=force_refresh,
         )
         return res  # type: ignore[no-any-return]
@@ -330,11 +360,29 @@ class FigmaClient:
         return await self._request("GET", f"/files/{file_key}/versions", params=params)
 
     # --- Components & Styles ---
-    async def get_file_components(self, file_key: str) -> dict[str, Any]:
-        return await self._request("GET", f"/files/{file_key}/components")
+    async def get_file_components(
+        self, file_key: str, *, force_refresh: bool = False
+    ) -> dict[str, Any]:
+        version_id = await self.get_file_version_id(file_key, force_refresh=force_refresh)
+        cache_key = TwoTierFigmaCache.make_key("get_file_components", file_key, version_id)
+        return await self._cache.get_or_set(  # type: ignore[no-any-return]
+            cache_key,
+            lambda: self._request("GET", f"/files/{file_key}/components"),
+            ttl_seconds=86400,
+            force_refresh=force_refresh,
+        )
 
-    async def get_file_styles(self, file_key: str) -> dict[str, Any]:
-        return await self._request("GET", f"/files/{file_key}/styles")
+    async def get_file_styles(
+        self, file_key: str, *, force_refresh: bool = False
+    ) -> dict[str, Any]:
+        version_id = await self.get_file_version_id(file_key, force_refresh=force_refresh)
+        cache_key = TwoTierFigmaCache.make_key("get_file_styles", file_key, version_id)
+        return await self._cache.get_or_set(  # type: ignore[no-any-return]
+            cache_key,
+            lambda: self._request("GET", f"/files/{file_key}/styles"),
+            ttl_seconds=86400,
+            force_refresh=force_refresh,
+        )
 
     async def get_file_component_sets(self, file_key: str) -> dict[str, Any]:
         return await self._request("GET", f"/files/{file_key}/component_sets")
@@ -363,7 +411,7 @@ class FigmaClient:
             params["cursor"] = cursor
         return await self._request("GET", f"/teams/{team_id}/component_sets", params=params)
 
-    # --- Comments & Reactions ---
+    # --- Comments & Reactions (Always Live, Never Cached) ---
     async def get_file_comments(
         self,
         file_key: str,
@@ -420,8 +468,17 @@ class FigmaClient:
         )
 
     # --- Variables ---
-    async def get_local_variables(self, file_key: str) -> dict[str, Any]:
-        return await self._request("GET", f"/files/{file_key}/variables/local")
+    async def get_local_variables(
+        self, file_key: str, *, force_refresh: bool = False
+    ) -> dict[str, Any]:
+        version_id = await self.get_file_version_id(file_key, force_refresh=force_refresh)
+        cache_key = TwoTierFigmaCache.make_key("get_local_variables", file_key, version_id)
+        return await self._cache.get_or_set(  # type: ignore[no-any-return]
+            cache_key,
+            lambda: self._request("GET", f"/files/{file_key}/variables/local"),
+            ttl_seconds=86400,
+            force_refresh=force_refresh,
+        )
 
     async def get_published_variables(self, file_key: str) -> dict[str, Any]:
         return await self._request("GET", f"/files/{file_key}/variables/published")

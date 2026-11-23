@@ -1,23 +1,30 @@
-"""In-memory TTL cache with LRU eviction and SingleFlight async request coalescing.
+"""Two-tier caching architecture with L1 in-process and optional L2 distributed Redis.
 
-Shields upstream Figma REST API from concurrent thundering-herd requests,
-honoring TTL expiration and strictly excluding 4xx/5xx/429 errors from being cached.
+Features:
+- L1 in-memory TTLCache (microsecond lookups for burst concurrency).
+- Optional L2 Redis cache (shared across horizontal Cloud Run instances).
+- SingleFlight async lock coalescing to prevent thundering-herd 429 rate limits.
+- Version-aware deterministic key hashing for automatic cache invalidation.
+- Graceful degradation if Redis is unavailable or unconfigured.
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
-from collections import OrderedDict
+import hashlib
+import json
+import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from typing import Any
 
+from cachetools import TTLCache as CachetoolsTTLCache
 
-@dataclass(slots=True)
-class _CacheEntry:
-    value: Any
-    expires_at: float
+try:
+    import redis.asyncio as redis
+except ImportError:  # pragma: no cover
+    redis = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 
 class SingleFlight:
@@ -76,81 +83,122 @@ class SingleFlight:
                     future.set_result(result)
 
 
-class TTLCache:
-    """Coroutine-safe within an asyncio event loop, bounded in-memory LRU cache with TTL."""
+class TwoTierFigmaCache:
+    """Two-tier cache: in-memory L1 TTLCache + optional distributed L2 Redis."""
 
-    def __init__(self, *, default_ttl: float = 300.0, maxsize: int = 100) -> None:
-        self._default_ttl = max(default_ttl, 0.0)
-        self._maxsize = max(maxsize, 1)
-        self._entries: OrderedDict[str, _CacheEntry] = OrderedDict()
-        self._lock = asyncio.Lock()
+    def __init__(
+        self,
+        *,
+        redis_url: str | None = None,
+        l1_ttl_seconds: float = 60.0,
+        l1_max_size: int = 512,
+        default_ttl: float | None = None,
+        maxsize: int | None = None,
+    ) -> None:
+        effective_ttl = default_ttl if default_ttl is not None else l1_ttl_seconds
+        effective_maxsize = maxsize if maxsize is not None else l1_max_size
+        self._default_ttl = effective_ttl
+        self._l1: CachetoolsTTLCache[str, Any] = CachetoolsTTLCache(
+            maxsize=effective_maxsize,
+            ttl=effective_ttl,
+        )
+        self._l1_lock = asyncio.Lock()
         self._single_flight = SingleFlight()
+        self._redis_client: Any | None = None
+        self._redis_url = redis_url
+
+        if redis_url and redis is not None:
+            try:
+                self._redis_client = redis.from_url(
+                    redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=2.0,
+                    socket_timeout=2.0,
+                )
+                logger.info("Configured L2 Redis cache at %s", redis_url.split("@")[-1])
+            except Exception as exc:
+                logger.warning("Failed to initialize Redis client, falling back to L1: %s", exc)
+                self._redis_client = None
+
+    @property
+    def has_l2(self) -> bool:
+        return self._redis_client is not None
+
+    @staticmethod
+    def make_key(tool: str, file_key: str, version: str, **params: Any) -> str:
+        """Construct a deterministic version-aware cache key."""
+        canonical = json.dumps(params, sort_keys=True, default=str)
+        param_hash = hashlib.sha256(canonical.encode()).hexdigest()[:12]
+        return f"figma:v1:{tool}:{file_key}:{version}:{param_hash}"
 
     async def get(self, key: str) -> Any | None:
-        """Retrieve a cached value if present and not expired."""
-        now = time.monotonic()
-        async with self._lock:
-            if key not in self._entries:
-                return None
-            entry = self._entries[key]
-            if entry.expires_at <= now:
-                # Expired: remove and return None
-                del self._entries[key]
-                return None
-            # Move to end for LRU tracking
-            self._entries.move_to_end(key)
-            return entry.value
+        """Lookup in L1, then L2. Promotes L2 hits to L1."""
+        # 1. Check L1 in-process
+        async with self._l1_lock:
+            if key in self._l1:
+                return self._l1[key]
 
-    async def set(self, key: str, value: Any, *, ttl: float | None = None) -> None:
-        """Store a value in cache with TTL. Evicts oldest entries if maxsize is exceeded."""
-        effective_ttl = self._default_ttl if ttl is None else max(ttl, 0.0)
-        if effective_ttl <= 0:
-            async with self._lock:
-                self._entries.pop(key, None)
-            return
+        # 2. Check L2 distributed Redis if available
+        if self._redis_client is not None:
+            try:
+                raw = await self._redis_client.get(key)
+                if raw:
+                    data = json.loads(raw)
+                    async with self._l1_lock:
+                        self._l1[key] = data
+                    return data
+            except Exception as exc:
+                logger.warning("L2 Redis read error for %s: %s", key, exc)
 
-        now = time.monotonic()
-        expires_at = now + effective_ttl
-        async with self._lock:
-            # Active eviction of expired keys to bound memory footprint
-            expired_keys = [k for k, v in self._entries.items() if v.expires_at <= now]
-            for k in expired_keys:
-                del self._entries[k]
+        return None
 
-            if key in self._entries:
-                self._entries.move_to_end(key)
-            self._entries[key] = _CacheEntry(value=value, expires_at=expires_at)
-            while len(self._entries) > self._maxsize:
-                self._entries.popitem(last=False)
+    async def set(
+        self,
+        key: str,
+        value: Any,
+        *,
+        ttl_seconds: int = 86400,
+    ) -> None:
+        """Store value in L1 and L2 asynchronously."""
+        async with self._l1_lock:
+            self._l1[key] = value
 
-    async def clear(self) -> None:
-        """Clear all cached entries."""
-        async with self._lock:
-            self._entries.clear()
+        if self._redis_client is not None:
+            try:
+                raw = json.dumps(value)
+                await self._redis_client.setex(key, ttl_seconds, raw)
+            except Exception as exc:
+                logger.warning("L2 Redis write error for %s: %s", key, exc)
 
     async def get_or_set(
         self,
         key: str,
-        fetch_coro_fn: Callable[[], Awaitable[Any]],
+        coro_fn: Callable[[], Awaitable[Any]],
         *,
-        ttl: float | None = None,
+        ttl_seconds: int = 86400,
         force_refresh: bool = False,
     ) -> Any:
-        """Retrieve from cache, or coalesce concurrent calls into a single fetch and cache."""
+        """Get cached value or execute coro_fn through SingleFlight lock coalescing."""
         if not force_refresh:
             cached = await self.get(key)
             if cached is not None:
                 return cached
 
-        async def _fetch_and_cache() -> Any:
-            # Recheck cache inside single-flight execution
-            if not force_refresh:
-                cached = await self.get(key)
-                if cached is not None:
-                    return cached
-            val = await fetch_coro_fn()
-            # Only cache non-empty valid responses
-            await self.set(key, val, ttl=ttl)
+        async def _fetch_and_store() -> Any:
+            val = await coro_fn()
+            await self.set(key, val, ttl_seconds=ttl_seconds)
             return val
 
-        return await self._single_flight.execute(key, _fetch_and_cache)
+        return await self._single_flight.execute(key, _fetch_and_store)
+
+    async def aclose(self) -> None:
+        """Close L2 Redis connection pool."""
+        if self._redis_client is not None:
+            try:
+                await self._redis_client.aclose()
+            except Exception as exc:
+                logger.debug("Error closing Redis client: %s", exc)
+
+
+# Legacy alias for backward compatibility with existing tests
+TTLCache = TwoTierFigmaCache

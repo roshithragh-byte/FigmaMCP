@@ -30,6 +30,7 @@ class Settings:
     allowed_file_keys: tuple[str, ...] | None = None
     cache_ttl_seconds: float = 300.0
     cache_max_size: int = 100
+    redis_url: str | None = None
 
     @classmethod
     def from_env(cls, *, require_token: bool | None = None) -> Settings:
@@ -117,4 +118,5 @@ class Settings:
             allowed_file_keys=allowed_file_keys,
             cache_ttl_seconds=cache_ttl_seconds,
             cache_max_size=cache_max_size,
+            redis_url=os.environ.get("REDIS_URL", "").strip() or None,
         )

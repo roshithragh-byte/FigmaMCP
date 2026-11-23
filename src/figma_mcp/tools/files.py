@@ -16,6 +16,7 @@ from figma_mcp.models import (
     GetFigmaNodesInput,
     GetFileVersionsInput,
 )
+from figma_mcp.pruner import prune_figma_node
 from figma_mcp.tools.common import (
     check_file_authorization,
     get_client,
@@ -65,9 +66,13 @@ def register_files_tools(
                 force_refresh=validated.force_refresh,
             )
             if validated.compact and "document" in raw_file:
+                # Apply deterministic pruning and vector compaction
+                raw_doc = raw_file["document"]
+                pruned = prune_figma_node(raw_doc)
+                doc_to_return = pruned if pruned is not None else compact_figma_node(raw_doc)
                 return {
                     **raw_file,
-                    "document": compact_figma_node(raw_file["document"]),
+                    "document": doc_to_return,
                 }
             return raw_file
         except ValidationError as exc:
@@ -111,9 +116,15 @@ def register_files_tools(
                 compacted_nodes: dict[str, Any] = {}
                 for nid, nentry in raw_nodes["nodes"].items():
                     if isinstance(nentry, dict) and "document" in nentry:
+                        pruned_doc = prune_figma_node(nentry["document"])
+                        doc_to_return = (
+                            pruned_doc
+                            if pruned_doc is not None
+                            else compact_figma_node(nentry["document"])
+                        )
                         compacted_nodes[nid] = {
                             **nentry,
-                            "document": compact_figma_node(nentry["document"]),
+                            "document": doc_to_return,
                         }
                     else:
                         compacted_nodes[nid] = nentry
